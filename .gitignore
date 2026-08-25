@@ -6,7 +6,8 @@ venv/
 
 # GCP / credentials
 *.json
-!schema.json
+!schema_raw.json
+!schema_windows.json
 .env
 
 # OS
