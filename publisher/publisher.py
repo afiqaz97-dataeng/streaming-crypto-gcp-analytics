@@ -28,17 +28,32 @@ COIN_IDS = {
     "ethereum": "ETH",
     "solana": "SOL",
 }
-POLL_INTERVAL_SECONDS = 10
+POLL_INTERVAL_SECONDS = 30  # CoinGecko free tier is rate-limited; keep this conservative
 ANOMALY_CHANCE = 0.15  # ~15% of readings get an injected spike/drop
 ANOMALY_MAGNITUDE = (0.03, 0.08)  # 3%-8% fake price jump
+MAX_RETRIES = 3
 
 
 def fetch_prices() -> dict:
-    """Fetch current prices for tracked coins from CoinGecko."""
+    """Fetch current prices for tracked coins from CoinGecko, with retry
+    and exponential backoff on rate limiting (HTTP 429)."""
     params = {"ids": ",".join(COIN_IDS.keys()), "vs_currencies": "usd"}
-    resp = requests.get(COINGECKO_URL, params=params, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+    backoff = 15
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.get(COINGECKO_URL, params=params, timeout=10)
+            if resp.status_code == 429:
+                print(f"Rate limited (attempt {attempt}/{MAX_RETRIES}), backing off {backoff}s...")
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            print(f"CoinGecko fetch failed (attempt {attempt}/{MAX_RETRIES}): {e}")
+            time.sleep(backoff)
+            backoff *= 2
+    raise RuntimeError("CoinGecko fetch failed after all retries")
 
 
 def maybe_inject_anomaly(price: float) -> tuple[float, bool]:
@@ -90,6 +105,8 @@ def main():
 
         except requests.RequestException as e:
             print(f"CoinGecko fetch failed: {e}")
+        except RuntimeError as e:
+            print(f"Giving up this cycle: {e}")
         except Exception as e:
             print(f"Unexpected error: {e}")
 
