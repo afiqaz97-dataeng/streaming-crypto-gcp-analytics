@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# GCP / credentials
+*.json
+!schema.json
+.env
+
+# OS
+.DS_Store

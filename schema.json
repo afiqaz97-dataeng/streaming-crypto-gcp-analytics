@@ -1,0 +1,7 @@
+[
+  {"name": "symbol", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "price_usd", "type": "FLOAT", "mode": "REQUIRED"},
+  {"name": "timestamp", "type": "TIMESTAMP", "mode": "REQUIRED"},
+  {"name": "pct_change", "type": "FLOAT", "mode": "NULLABLE"},
+  {"name": "is_anomaly", "type": "BOOLEAN", "mode": "NULLABLE"}
+]
