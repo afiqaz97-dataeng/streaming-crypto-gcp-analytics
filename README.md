@@ -1,8 +1,10 @@
-# Crypto Streaming Analytics Pipeline
+# Crypto Streaming Analytics Pipeline (Apache Beam / Dataflow)
 
-A real-time streaming analytics pipeline on Google Cloud Platform that ingests
-live cryptocurrency prices (BTC, ETH, SOL), detects anomalous price
-movements, and surfaces them in a live dashboard.
+A real-time streaming analytics pipeline on GCP that ingests live
+cryptocurrency prices (BTC, ETH, SOL), runs them through an Apache Beam
+pipeline on Dataflow, and produces two outputs: a per-event anomaly-flagged
+stream (stateful processing) and windowed price statistics (fixed windows +
+CombinePerKey).
 
 ## Architecture
 
@@ -14,69 +16,100 @@ movements, and surfaces them in a live dashboard.
             │ publishes JSON
             ▼
  ┌────────────────────┐
- │  Pub/Sub            │   Topic: crypto-prices
- │  (message queue)    │
- └──────────┬───────────┘
-            │ triggers
-            ▼
- ┌────────────────────┐
- │  Cloud Function     │   Gen 2, Pub/Sub-triggered
- │  (Gen 2)            │   - Looks up last price for the coin in BigQuery
- │                      │   - Computes % change
- │                      │   - Flags anomaly if |% change| >= 1.5%
- └──────────┬───────────┘
-            │ streaming insert
-            ▼
- ┌────────────────────┐
- │  BigQuery            │   Table: crypto_analytics.crypto_prices
- │  (data warehouse)    │
+ │  Pub/Sub             │   Topic: crypto-prices
+ │  (message queue)     │   Subscription: crypto-prices-sub
  └──────────┬───────────┘
             │
             ▼
- ┌────────────────────┐
- │  Looker Studio       │   Live line chart of prices + anomaly markers
- │  (dashboard)          │
- └────────────────────┘
+ ┌─────────────────────────────────────────────┐
+ │  Dataflow (Apache Beam, Python)              │
+ │                                               │
+ │   ┌─────────────────────────────────────┐   │
+ │   │ Branch 1: Stateful anomaly detection │   │
+ │   │ - Keyed by symbol                     │   │
+ │   │ - Beam per-key state holds last price │   │
+ │   │ - Flags if |% change| >= 1.5%         │   │
+ │   └──────────────┬──────────────────────┘   │
+ │                  │                            │
+ │   ┌──────────────▼──────────────────────┐   │
+ │   │ Branch 2: Windowed aggregation       │   │
+ │   │ - FixedWindows(30s), keyed by symbol │   │
+ │   │ - CombinePerKey: avg/min/max/volatility│  │
+ │   └──────────────┬──────────────────────┘   │
+ └──────────────────┼────────────────────────────┘
+                     │
+        ┌────────────┴────────────┐
+        ▼                          ▼
+ ┌──────────────┐          ┌───────────────────┐
+ │ BigQuery      │          │ BigQuery           │
+ │ crypto_prices_│          │ crypto_price_      │
+ │ raw           │          │ windows             │
+ └──────┬────────┘          └─────────┬──────────┘
+        │                              │
+        └──────────────┬───────────────┘
+                        ▼
+                ┌──────────────┐
+                │ Looker Studio │
+                │ (dashboards)  │
+                └──────────────┘
 ```
 
 ## Why this architecture
 
-This pipeline intentionally uses **Cloud Functions instead of Dataflow** for
-the processing layer. For a low-throughput stream like this (3 coins, one
-reading every ~10s), Dataflow's windowing/watermark machinery is more
-operational overhead than the workload needs. An event-driven Cloud
-Function keeps the pipeline simple, cheap (mostly within the free tier), and
-easy to reason about, while still demonstrating the core streaming pattern:
-**ingest → process → store → visualize**, decoupled through a message queue.
+This version deliberately trades the simplicity of a Cloud Function for
+**Dataflow + Apache Beam**, to demonstrate two core streaming-processing
+concepts that a simple pub/sub-triggered function can't show:
 
-If throughput grew (many more symbols, sub-second ticks, or a need for
-stateful windowed aggregations like rolling VWAP), Dataflow would be the
-natural next step — the Pub/Sub topic this pipeline already publishes to
-could feed a Beam pipeline without changing the ingestion layer at all.
+1. **Stateful processing** — the anomaly detector doesn't query a database
+   for the last price; it holds it in Beam's per-key state
+   (`ReadModifyWriteStateSpec`), which Beam manages transparently across
+   worker autoscaling and restarts. This is the pattern behind things like
+   session tracking, deduplication, and running aggregates in real systems.
+
+2. **Windowing** — `FixedWindows(30s)` groups events into time buckets per
+   symbol, and `CombinePerKey` reduces each window to avg/min/max/volatility.
+   This is the same primitive used for things like "requests per minute" or
+   "revenue per hour" in production analytics pipelines, and it's usually
+   the concept interviewers probe hardest on.
+
+The pipeline logic is unit-tested locally with `TestStream` and
+`DirectRunner` before ever touching Dataflow (see `dataflow/test_pipeline.py`)
+— both the stateful anomaly logic and the windowed aggregation are verified
+independent of GCP infra.
 
 ## Anomaly detection logic
 
-Each incoming price is compared to the last stored price for that symbol.
-A row is flagged `is_anomaly = true` if:
-- the price moved more than **1.5%** since the last reading, OR
+Each event is compared to the previous price *for that symbol*, held in
+Beam state. A row is flagged `is_anomaly = true` if:
+- the price moved more than **1.5%** since the last event, OR
 - the publisher tagged it as an injected demo anomaly
 
-This is a simple threshold rule by design — easy to explain, easy to verify
-correctness of, and a reasonable v1 for a real system. A natural extension
-would be a rolling z-score or an anomaly-detection model served from Vertex AI.
+## Windowed aggregation logic
+
+Every **30 seconds**, per symbol, the pipeline emits:
+- `avg_price`, `min_price`, `max_price`
+- `volatility` (max − min within the window)
+- `event_count`
+
+Windows use the default `AfterWatermark` trigger with `DISCARDING`
+accumulation mode — each window fires exactly once, when Beam's watermark
+passes the window's end. A natural extension (noted below) is adding early
+firings for a live "in-progress window" view.
 
 ## Project structure
 
 ```
 crypto-streaming-analytics/
 ├── publisher/
-│   ├── publisher.py        # Polls CoinGecko, publishes to Pub/Sub
+│   ├── publisher.py          # Polls CoinGecko, publishes to Pub/Sub
 │   └── requirements.txt
-├── cloud_function/
-│   ├── main.py              # Pub/Sub-triggered function -> BigQuery
+├── dataflow/
+│   ├── pipeline.py           # Beam pipeline: stateful DoFn + windowing
+│   ├── test_pipeline.py      # Local unit tests (TestStream, DirectRunner)
 │   └── requirements.txt
-├── schema.json               # BigQuery table schema
-├── deploy.sh                 # One-shot deploy script for Cloud Shell
+├── schema_raw.json           # BigQuery schema: crypto_prices_raw
+├── schema_windows.json       # BigQuery schema: crypto_price_windows
+├── deploy.sh                 # Provisions Pub/Sub, GCS, BigQuery infra
 └── README.md
 ```
 
@@ -84,46 +117,48 @@ crypto-streaming-analytics/
 
 1. Clone this repo and `cd` into it in Cloud Shell.
 2. Make sure billing is enabled on your project.
-3. Run the deploy script:
+3. Provision infra:
    ```bash
    bash deploy.sh
    ```
-   This enables the required APIs, creates the Pub/Sub topic, creates the
-   BigQuery dataset/table, and deploys the Cloud Function.
-4. Start the publisher (in Cloud Shell or locally with `gcloud auth
-   application-default login`):
+   This enables required APIs and creates the Pub/Sub topic/subscription,
+   GCS staging bucket, and both BigQuery tables.
+4. (Optional but recommended) Run the local pipeline tests first:
+   ```bash
+   cd dataflow
+   pip install -r requirements.txt --break-system-packages
+   python test_pipeline.py -v
+   ```
+5. Start the publisher (Cloud Shell tab 1):
    ```bash
    cd publisher
    pip install -r requirements.txt --break-system-packages
    python publisher.py --project_id=crypto-etl-project-465203
    ```
-5. Watch data land in BigQuery:
-   ```bash
-   bq query --use_legacy_sql=false \
-     'SELECT * FROM `crypto-etl-project-465203.crypto_analytics.crypto_prices`
-      ORDER BY timestamp DESC LIMIT 20'
-   ```
-6. Connect [Looker Studio](https://lookerstudio.google.com) to the
-   `crypto_analytics.crypto_prices` BigQuery table and build a time-series
-   chart of `price_usd` by `symbol`, with `is_anomaly` as a marker/filter.
+6. Launch the Dataflow job (Cloud Shell tab 2) — `deploy.sh` prints the
+   exact command with your project/bucket filled in. It takes ~3-5 minutes
+   for Dataflow to spin up worker VMs; track it at
+   `console.cloud.google.com/dataflow/jobs`.
+7. Query BigQuery to confirm data is flowing (commands printed by `deploy.sh`).
+8. Connect Looker Studio to `crypto_prices_raw` (live price + anomaly
+   markers) and `crypto_price_windows` (volatility over time).
 
 ## Cost notes
 
-- **Pub/Sub**: free tier covers 10GB/month, this pipeline uses a fraction of that.
-- **Cloud Functions**: free tier covers 2M invocations/month; at 3 messages
-  every 10s this is ~26k invocations/month.
-- **BigQuery**: streaming inserts and storage for this data volume are
-  effectively free-tier; querying is billed per TB scanned (negligible here).
+- **Dataflow** is the main cost here — a streaming job runs continuously on
+  at least one worker VM (n1-standard-1 by default) until you cancel it.
+  Budget roughly $0.05-$0.10/hour for a minimal streaming job. **Cancel the
+  job when you're done demoing**: `gcloud dataflow jobs list --region=us-central1`
+  then `gcloud dataflow jobs cancel <JOB_ID> --region=us-central1`.
+- **Pub/Sub, BigQuery, GCS**: negligible at this data volume, within free tier.
 - **Looker Studio**: free.
-
-Realistically this pipeline costs **$0** to run for a portfolio demo, as
-long as you stop the publisher script when you're done (it's the only
-long-running process).
 
 ## Possible extensions
 
-- Swap Cloud Function for a Dataflow (Apache Beam) pipeline to support
-  windowed aggregations (rolling VWAP, volatility bands).
-- Add Slack/email alerting on anomalies via a second Pub/Sub topic.
+- Add early/speculative triggers (`AfterWatermark(early=AfterProcessingTime(10))`)
+  to emit in-progress window results for a more "live" dashboard.
+- Add sliding windows for a rolling volatility view instead of discrete buckets.
+- Replace the fixed 1.5% threshold with a rolling z-score computed in the
+  stateful DoFn.
 - Add Terraform to provision all infra as code.
-- Add a Vertex AI-based anomaly model instead of a fixed threshold.
+- Add Slack/email alerting on anomalies via a side-output Pub/Sub topic.
