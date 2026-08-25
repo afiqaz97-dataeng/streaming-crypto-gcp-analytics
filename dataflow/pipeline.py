@@ -43,7 +43,7 @@ import logging
 from datetime import datetime, timezone
 
 import apache_beam as beam
-from apache_beam.options.pipeline_options import PipelineOptions, StandardOptions
+from apache_beam.options.pipeline_options import PipelineOptions, StandardOptions, SetupOptions
 from apache_beam.transforms.userstate import ReadModifyWriteStateSpec
 from apache_beam.coders import FloatCoder
 from apache_beam.transforms.window import FixedWindows
@@ -167,6 +167,10 @@ def run(argv=None):
 
     options = PipelineOptions(pipeline_args)
     options.view_as(StandardOptions).streaming = True
+    # Required so that module-level constants/functions defined in this file
+    # (e.g. ANOMALY_THRESHOLD_PCT) are available inside DoFns when they run
+    # on separate Dataflow worker processes, not just under DirectRunner.
+    options.view_as(SetupOptions).save_main_session = True
     project = options.get_all_options().get("project")
 
     raw_table = f"{project}:{known_args.output_dataset}.crypto_prices_raw"
