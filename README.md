@@ -84,6 +84,14 @@ Beam state. A row is flagged `is_anomaly = true` if:
 - the price moved more than **1.5%** since the last event, OR
 - the publisher tagged it as an injected demo anomaly
 
+## Dashboard
+
+![Live Looker Studio dashboard showing BTC/ETH/SOL price lines and a table of flagged anomalies](docs/screenshots/dashboard.png)
+
+Connected to `crypto_prices_raw`: a live price line per symbol plus a table
+filtered to `is_anomaly = true`, showing the exact rows the stateful
+detector flagged along with their `pct_change`.
+
 ## Windowed aggregation logic
 
 Every **30 seconds**, per symbol, the pipeline emits:
