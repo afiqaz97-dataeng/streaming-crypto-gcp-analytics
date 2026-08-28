@@ -153,12 +153,3 @@ crypto-streaming-analytics/
 - **Pub/Sub, BigQuery, GCS**: negligible at this data volume, within free tier.
 - **Looker Studio**: free.
 
-## Possible extensions
-
-- Add early/speculative triggers (`AfterWatermark(early=AfterProcessingTime(10))`)
-  to emit in-progress window results for a more "live" dashboard.
-- Add sliding windows for a rolling volatility view instead of discrete buckets.
-- Replace the fixed 1.5% threshold with a rolling z-score computed in the
-  stateful DoFn.
-- Add Terraform to provision all infra as code.
-- Add Slack/email alerting on anomalies via a side-output Pub/Sub topic.
